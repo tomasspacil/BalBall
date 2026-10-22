@@ -1,0 +1,709 @@
+<!DOCTYPE html>
+<html lang="cs">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=no, viewport-fit=cover">
+  <meta name="theme-color" content="#d9eff8">
+  <title>Pastelová kulička</title>
+  <style>
+    * { box-sizing: border-box; }
+    html, body { margin: 0; width: 100%; height: 100%; overflow: hidden; }
+    body { background: #d9eff8; touch-action: none; overscroll-behavior: none; font-family: Arial, sans-serif; }
+    canvas { display: block; width: 100%; height: 100%; touch-action: none; }
+    #menu {
+      position: fixed; inset: 0; z-index: 10;
+      display: flex; align-items: center; justify-content: center;
+      background: linear-gradient(180deg, #d6edf8 0%, #e8f5ef 100%);
+      transition: opacity 0.8s ease;
+    }
+    #menu.hidden { opacity: 0; pointer-events: none; }
+    #play {
+      appearance: none; -webkit-appearance: none;
+      width: min(58vw, 240px); height: 100px;
+      border: 0; border-radius: 28px;
+      background: #99c9bb; color: #274e49;
+      font-size: 30px; font-weight: 700; letter-spacing: 4px;
+      box-shadow: 0 8px 0 #7bad9e;
+      cursor: pointer; touch-action: manipulation;
+    }
+    #play:active { transform: translateY(4px); box-shadow: 0 4px 0 #7bad9e; }
+    #play:focus-visible { outline: 4px solid #507f78; outline-offset: 7px; }
+  </style>
+</head>
+<body>
+  <div id="menu"><button id="play" type="button">PLAY</button></div>
+
+  <script type="module">
+    import * as THREE from 'https://cdn.jsdelivr.net/npm/three@0.180.0/build/three.module.js';
+
+    // --- Klidné a stále stejné tempo ---
+    const SPEED = 2.75;                   // běžná rychlost se časem nezvyšuje
+    const FORWARD_BOOST = 1.45;          // pouze při náklonu dopředu
+    const LATERAL_SPEED = 2.65;         // pohyb doleva/doprava podle náklonu
+    const ROAD_WIDTH = 2.22;
+    const BALL_RADIUS = 0.62;
+    const JUMP_DISTANCE = 4.9;          // stejná délka skoku i při vyšší rychlosti
+    const JUMP_HEIGHT = 1.75;
+    const FALL_WAIT = 2.0;
+    const RESCUE_TIME = 1.60;
+    const SCENERY_LENGTH = 42;
+    const SKY = 0xd8eef8;
+
+    const scene = new THREE.Scene();
+    scene.background = new THREE.Color(SKY);
+    scene.fog = new THREE.Fog(SKY, 43, 145);
+
+    const camera = new THREE.PerspectiveCamera(59, 1, 0.1, 175);
+    camera.position.set(0, 4.6, -9.5);
+    const cameraLook = new THREE.Vector3(0, 0.5, 8);
+
+    const renderer = new THREE.WebGLRenderer({ antialias: true, alpha: false, powerPreference: 'high-performance' });
+    renderer.setPixelRatio(Math.min(window.devicePixelRatio || 1, 1.6));
+    renderer.setSize(window.innerWidth, window.innerHeight);
+    renderer.outputColorSpace = THREE.SRGBColorSpace;
+    document.body.insertBefore(renderer.domElement, document.getElementById('menu'));
+
+    scene.add(new THREE.HemisphereLight(0xffffff, 0xb8c4b3, 2.0));
+    const sun = new THREE.DirectionalLight(0xffffff, 0.75);
+    sun.position.set(-15, 35, -20);
+    scene.add(sun);
+
+    // Jednotné matné materiály. Nepoužívají se textury ani odlesky.
+    const matte = (color) => new THREE.MeshLambertMaterial({ color, flatShading: true });
+    const mat = {
+      road: [matte(0xe8ddd2), matte(0xece0d5), matte(0xe6dacf)],
+      roadSide: matte(0xcec1b5),
+      roadEdge: matte(0xf5eee5),
+      ball: matte(0xe4a8ad),
+      ballBand: matte(0xffebd5),
+      grassA: matte(0xa9caaa),
+      grassB: matte(0xb4d2b0),
+      soil: matte(0xc1ab97),
+      patch: matte(0x99b998),
+      treeTrunk: matte(0xb99a82),
+      treeA: matte(0x84b69b),
+      treeB: matte(0x9fc8a9),
+      treeC: matte(0xb6d5ad),
+      riverBank: matte(0xd0c5a4),
+      water: matte(0x9bd2db),
+      rail: matte(0x929fa3),
+      railTie: matte(0xb6a48e),
+      train: matte(0xcba8c8),
+      trainRoof: matte(0xf0d3c3),
+      wheel: matte(0x89949b),
+      window: matte(0xbfe2e7),
+      lightHouse: matte(0xf4eee5),
+      stripe: matte(0xe7a5a2),
+      roof: matte(0xd79291),
+      cloud: matte(0xffffff),
+      support: matte(0xc5b5a8)
+    };
+
+    const cubeGeometry = new THREE.BoxGeometry(1, 1, 1);
+    function addBox(parent, material, x, y, z, sx, sy, sz) {
+      const mesh = new THREE.Mesh(cubeGeometry, material);
+      mesh.position.set(x, y, z);
+      mesh.scale.set(sx, sy, sz);
+      parent.add(mesh);
+      return mesh;
+    }
+    const random = (a, b) => a + Math.random() * (b - a);
+    const clamp = (v, a, b) => Math.max(a, Math.min(b, v));
+    const smooth = (t) => t * t * (3 - 2 * t);
+    const smoother = (t) => t * t * t * (t * (t * 6 - 15) + 10);
+
+    // --- Náhodné dlouhé a plynulé zatáčky. Střed trati je funkcí vzdálenosti. ---
+    // Žádné ostré rohy. Dítě musí naklonit telefon ve směru pokračování trati.
+    const turns = [];
+    let pathCursor = 36;
+    let pathX = 0;
+    let pathBaseX = 0;
+
+    function ensurePath(z) {
+      while (pathCursor < z + 180) {
+        const start = pathCursor;
+        const end = start + random(23, 31);
+        // Následující zatočení může být vlevo i vpravo, vždy však mírné.
+        const direction = pathX > 4.5 ? -1 : pathX < -4.5 ? 1 : (Math.random() < 0.5 ? -1 : 1);
+        const nextX = clamp(pathX + direction * random(2.5, 4.2), -7.5, 7.5);
+        turns.push({ start, end, from: pathX, to: nextX });
+        pathX = nextX;
+        pathCursor = end + random(11, 20);  // rovinka mezi zatáčkami
+      }
+      while (turns.length > 1 && turns[0].end < z - 85) {
+        pathBaseX = turns.shift().to;
+      }
+    }
+
+    function centerXAt(z) {
+      let x = pathBaseX;
+      for (const t of turns) {
+        if (z < t.start) return x;
+        if (z <= t.end) return t.from + (t.to - t.from) * smoother((z - t.start) / (t.end - t.start));
+        x = t.to;
+      }
+      return x;
+    }
+
+    function slopeAt(z) {
+      return (centerXAt(z + 0.18) - centerXAt(z - 0.18)) / 0.36;
+    }
+
+    // --- Kulička ---
+    const ball = new THREE.Group();
+    const sphere = new THREE.Mesh(new THREE.SphereGeometry(BALL_RADIUS, 20, 14), mat.ball);
+    ball.add(sphere);
+    const ringGeometry = new THREE.TorusGeometry(BALL_RADIUS + 0.002, 0.019, 5, 36);
+    const ring1 = new THREE.Mesh(ringGeometry, mat.ballBand);
+    ring1.rotation.y = 0.55;
+    ball.add(ring1);
+    const ring2 = new THREE.Mesh(ringGeometry, mat.ballBand);
+    ring2.rotation.x = Math.PI / 2;
+    ball.add(ring2);
+    scene.add(ball);
+
+    const shadow = new THREE.Mesh(
+      new THREE.CircleGeometry(0.46, 24),
+      new THREE.MeshBasicMaterial({ color: 0x777f79, transparent: true, opacity: 0.14, depthWrite: false })
+    );
+    shadow.rotation.x = -Math.PI / 2;
+    shadow.position.y = 0.017;
+    scene.add(shadow);
+
+    // --- Úzká nekonečná cesta; její geometrie skutečně zatáčí. ---
+    let roadCursor = -45;
+    const roadSections = [];
+    const gaps = [];
+    let sectionNumber = 0;
+
+    // Pás podél hladké křivky: osa Z je vzdálenost, X je poloha středu cesty.
+    function makeRibbon(start, end, left, right, top, bottom, material) {
+      const count = Math.max(2, Math.ceil((end - start) / 0.55));
+      const positions = [];
+      const indices = [];
+      for (let i = 0; i <= count; i++) {
+        const z = start + (end - start) * i / count;
+        const cx = centerXAt(z);
+        const slope = slopeAt(z);
+        const inv = 1 / Math.sqrt(1 + slope * slope);
+        for (const offset of [left, right]) {
+          positions.push(cx + offset * inv, top, z - offset * slope * inv);
+        }
+        for (const offset of [left, right]) {
+          positions.push(cx + offset * inv, bottom, z - offset * slope * inv);
+        }
+        if (i > 0) {
+          const a = (i - 1) * 4, b = i * 4;
+          // horní plocha, boky a spodní plocha
+          indices.push(a,b,a+1, b,b+1,a+1);
+          indices.push(a,a+2,b, b,a+2,b+2);
+          indices.push(a+1,b+1,a+3, b+1,b+3,a+3);
+          indices.push(a+2,a+3,b+2, b+2,a+3,b+3);
+        }
+      }
+      // zakončení obou konců (důležité u děr)
+      indices.push(0,1,2, 1,3,2);
+      const e = count * 4;
+      indices.push(e,e+2,e+1, e+1,e+2,e+3);
+      const g = new THREE.BufferGeometry();
+      g.setAttribute('position', new THREE.Float32BufferAttribute(positions, 3));
+      g.setIndex(indices);
+      g.computeVertexNormals();
+      const mesh = new THREE.Mesh(g, material);
+      mesh.material.side = THREE.DoubleSide;
+      return mesh;
+    }
+
+    function addRoadSection(start, end) {
+      const group = new THREE.Group();
+      group.add(makeRibbon(start, end, -ROAD_WIDTH / 2, ROAD_WIDTH / 2,
+        0, -0.34, mat.road[sectionNumber++ % mat.road.length]));
+      group.add(makeRibbon(start, end, -ROAD_WIDTH / 2 + 0.04, ROAD_WIDTH / 2 - 0.04,
+        -0.34, -0.39, mat.roadSide));
+      for (const sign of [-1, 1]) {
+        const edge = sign * (ROAD_WIDTH / 2 - 0.075);
+        group.add(makeRibbon(start, end, edge - 0.034, edge + 0.034,
+          0.014, 0.008, mat.roadEdge));
+      }
+      scene.add(group);
+      roadSections.push({ start, end, group });
+    }
+
+    function ensureRoad(z) {
+      ensurePath(z);
+      while (roadCursor < z + 155) {
+        const length = roadSections.length === 0 ? 77 : random(26, 37);
+        addRoadSection(roadCursor, roadCursor + length);
+        roadCursor += length;
+        const gapLength = random(2.45, 2.75);
+        gaps.push({ start: roadCursor, end: roadCursor + gapLength });
+        roadCursor += gapLength;
+      }
+      while (roadSections.length && roadSections[0].end < z - 49) {
+        const old = roadSections.shift();
+        scene.remove(old.group);
+        old.group.traverse(o => { if (o.isMesh) o.geometry.dispose(); });
+      }
+      while (gaps.length && gaps[0].end < z - 49) gaps.shift();
+    }
+
+    function hasRoad(z) {
+      return roadSections.some(s => z >= s.start && z <= s.end);
+    }
+
+    function nextGap(z) {
+      return gaps.find(g => g.end > z - 0.35);
+    }
+
+    // --- Jednoduchá krajina hluboko pod tratí ---
+    let sceneryCursor = -SCENERY_LENGTH;
+    let sceneryIndex = -1;
+    const scenery = [];
+
+    function makeTree(parent, x, z, size) {
+      const h = 2.0 * size;
+      addBox(parent, mat.treeTrunk, x, -11.18 + h / 2, z, 0.48 * size, h, 0.48 * size);
+      addBox(parent, mat.treeA, x, -11.18 + h + 0.66 * size, z,
+        2.2 * size, 1.55 * size, 2.2 * size);
+      addBox(parent, Math.random() < 0.5 ? mat.treeB : mat.treeC,
+        x, -11.18 + h + 1.78 * size, z,
+        1.50 * size, 1.08 * size, 1.50 * size);
+    }
+
+    function makeCloud(parent, x, y, z) {
+      addBox(parent, mat.cloud, x, y, z, 3.7, 1.25, 1.65);
+      addBox(parent, mat.cloud, x - 1.45, y - 0.24, z + 0.15, 2.05, 0.90, 1.45);
+      addBox(parent, mat.cloud, x + 1.35, y - 0.18, z - 0.12, 2.3, 1.00, 1.55);
+      addBox(parent, mat.cloud, x + 0.20, y + 0.56, z, 2.10, 1.00, 1.40);
+    }
+
+    function makeTrain(parent, z) {
+      const x = 19;
+      addBox(parent, mat.train, x, -9.93, z + 3.2, 2.25, 1.65, 3.5);
+      addBox(parent, mat.trainRoof, x, -8.97, z + 3.2, 2.45, 0.28, 3.75);
+      addBox(parent, mat.train, x, -9.85, z - 0.90, 2.22, 1.72, 3.65);
+      addBox(parent, mat.trainRoof, x, -8.88, z - 0.90, 2.38, 0.25, 3.75);
+      addBox(parent, mat.train, x, -9.85, z - 5.05, 2.22, 1.72, 3.65);
+      addBox(parent, mat.trainRoof, x, -8.88, z - 5.05, 2.38, 0.25, 3.75);
+      for (const zz of [z + 3.8, z + 2.65, z - 0.3, z - 1.6, z - 4.5, z - 5.65]) {
+        addBox(parent, mat.window, x - 1.14, -9.46, zz, 0.05, 0.64, 0.65);
+        addBox(parent, mat.window, x + 1.14, -9.46, zz, 0.05, 0.64, 0.65);
+      }
+      for (const zz of [z + 4.4, z + 2.1, z + 0.1, z - 2.1, z - 3.95, z - 6.1]) {
+        addBox(parent, mat.wheel, x - 0.93, -10.80, zz, 0.25, 0.48, 0.58);
+        addBox(parent, mat.wheel, x + 0.93, -10.80, zz, 0.25, 0.48, 0.58);
+      }
+    }
+
+    function makeLighthouse(parent, z) {
+      const x = -33;
+      addBox(parent, mat.lightHouse, x, -7.55, z, 3.0, 7.3, 3.0);
+      addBox(parent, mat.stripe, x, -8.5, z, 3.12, 1.25, 3.12);
+      addBox(parent, mat.stripe, x, -5.8, z, 3.12, 1.15, 3.12);
+      addBox(parent, mat.window, x, -3.5, z, 3.45, 1.18, 3.45);
+      addBox(parent, mat.roof, x, -2.55, z, 4.0, 0.75, 4.0);
+    }
+
+    function makeSceneryChunk(start, index) {
+      const parent = new THREE.Group();
+      const mid = start + SCENERY_LENGTH / 2;
+      addBox(parent, index % 2 ? mat.grassA : mat.grassB,
+        0, -12.0, mid, 115, 1.64, SCENERY_LENGTH + 0.04);
+
+      // Řeka a její měkké břehy.
+      addBox(parent, mat.riverBank, -18.5, -11.10, mid, 7.2, 0.12, SCENERY_LENGTH + 0.05);
+      addBox(parent, mat.water, -18.5, -11.015, mid, 5.6, 0.09, SCENERY_LENGTH + 0.08);
+
+      // Železnice a malý klidně stojící vláček.
+      for (const xx of [18.15, 19.85]) {
+        addBox(parent, mat.rail, xx, -11.02, mid, 0.14, 0.16, SCENERY_LENGTH + 0.08);
+      }
+      for (let zz = start + 1.5; zz < start + SCENERY_LENGTH; zz += 3.5) {
+        addBox(parent, mat.railTie, 19, -11.12, zz, 2.8, 0.15, 0.48);
+      }
+      if (index % 4 === 0) makeTrain(parent, start + 25);
+      if (index % 5 === 1) makeLighthouse(parent, start + 20);
+
+      // Několik jednoduchých stromů a malých barevných ploch.
+      for (let i = 0; i < 12; i++) {
+        const x = (i % 2 ? 1 : -1) * random(6.3, 48);
+        const z = start + random(3, SCENERY_LENGTH - 3);
+        if ((x < -14 && x > -23) || (x > 15 && x < 23)) continue;
+        makeTree(parent, x, z, random(0.72, 1.30));
+      }
+      for (let i = 0; i < 4; i++) {
+        const x = (i % 2 ? 1 : -1) * random(25, 50);
+        addBox(parent, mat.patch, x, -11.166, start + random(2, 40),
+          random(2.5, 5.5), 0.035, random(2.5, 6));
+      }
+
+      // Mraky jsou statické: nikam se neposouvají ani neblikají.
+      if (index % 2 === 0) {
+        makeCloud(parent, random(-20, -10), random(16, 23), start + random(6, 28));
+        makeCloud(parent, random(10, 26), random(17, 25), start + random(12, 36));
+      }
+
+      // Nenápadná podpěra pod silnicí, ne však zábradlí po stranách.
+      addBox(parent, mat.support, centerXAt(start + 11), -5.65, start + 11, 0.63, 10.9, 0.7);
+      addBox(parent, mat.support, centerXAt(start + 32), -5.65, start + 32, 0.63, 10.9, 0.7);
+
+      scene.add(parent);
+      scenery.push({ end: start + SCENERY_LENGTH, group: parent });
+    }
+
+    function ensureScenery(z) {
+      while (sceneryCursor < z + 155) {
+        makeSceneryChunk(sceneryCursor, sceneryIndex++);
+        sceneryCursor += SCENERY_LENGTH;
+      }
+      while (scenery.length && scenery[0].end < z - 48) {
+        scene.remove(scenery.shift().group);
+      }
+    }
+
+    // --- Telefon: náklon vlevo/vpravo (gamma), dopředu (beta). ---
+    // Zkalibruje se při PLAY; nejsou potřeba předpoklady o sklonu držení telefonu.
+    let latestGamma = null, latestBeta = null;
+    let neutralGamma = null, neutralBeta = null;
+    let orientationAt = -Infinity;
+    let gravityX = null, gravityY = null;
+    let neutralGravityX = null, neutralGravityY = null;
+    let motionAt = -Infinity;
+    let filteredSteering = 0;
+    let dragAmount = 0;
+    let fingerDown = false;
+    let fingerX = 0;
+    let pointerMoved = false;
+    let displayRotation = 0;
+    const keys = { left: false, right: false, forward: false };
+
+    function receiveOrientation(event) {
+      if (!Number.isFinite(event.gamma) || !Number.isFinite(event.beta)) return;
+      latestGamma = event.gamma;
+      latestBeta = event.beta;
+      orientationAt = performance.now();
+      if (phase === 'playing' && neutralGamma === null) {
+        neutralGamma = latestGamma;
+        neutralBeta = latestBeta;
+      }
+    }
+    window.addEventListener('deviceorientation', receiveOrientation, { passive: true });
+    // Záložní kanál pro některé Android prohlížeče.
+    window.addEventListener('deviceorientationabsolute', e => {
+      if (performance.now() - orientationAt > 300) receiveOrientation(e);
+    }, { passive: true });
+    window.addEventListener('devicemotion', event => {
+      const g = event.accelerationIncludingGravity;
+      if (!g || !Number.isFinite(g.x) || !Number.isFinite(g.y)) return;
+      gravityX = g.x;
+      gravityY = g.y;
+      motionAt = performance.now();
+      if (phase === 'playing' && neutralGravityX === null) {
+        neutralGravityX = gravityX;
+        neutralGravityY = gravityY;
+      }
+    }, { passive: true });
+
+    function angleDiff(a, b) {
+      return ((a - b + 540) % 360) - 180;
+    }
+
+    function steeringInput() {
+      if (keys.left || keys.right) return (keys.right ? 1 : 0) - (keys.left ? 1 : 0);
+      if (fingerDown && Math.abs(dragAmount) > 0.08) return dragAmount;
+      if (latestGamma !== null && performance.now() - orientationAt < 1000) {
+        if (neutralGamma === null) { neutralGamma = latestGamma; neutralBeta = latestBeta; }
+        // 18° odpovídá skoro maximálnímu zatáčení; není tu samonavádění na střed.
+        return clamp(angleDiff(latestGamma, neutralGamma) / 18, -1.5, 1.5);
+      }
+      if (gravityX !== null && performance.now() - motionAt < 1000) {
+        if (neutralGravityX === null) { neutralGravityX = gravityX; neutralGravityY = gravityY; }
+        return clamp((gravityX - neutralGravityX) / 3.0, -1.5, 1.5);
+      }
+      return dragAmount;
+    }
+
+    function currentSpeed() {
+      if (keys.forward) return SPEED + FORWARD_BOOST;
+      let forwardAmount = 0;
+      if (latestBeta !== null && neutralBeta !== null && performance.now() - orientationAt < 1000) {
+        // Předklon telefonu: horní hrana se nakloní směrem od dítěte.
+        forwardAmount = clamp(angleDiff(neutralBeta, latestBeta) / 17, 0, 1);
+      } else if (gravityY !== null && neutralGravityY !== null && performance.now() - motionAt < 1000) {
+        forwardAmount = clamp((gravityY - neutralGravityY) / 3, 0, 1);
+      }
+      return SPEED + FORWARD_BOOST * forwardAmount;
+    }
+
+    function calibrateSensors() {
+      neutralGamma = latestGamma;
+      neutralBeta = latestBeta;
+      neutralGravityX = gravityX;
+      neutralGravityY = gravityY;
+      filteredSteering = 0;
+    }
+
+    // --- Herní stav ---
+    let phase = 'menu'; // menu / playing / falling / rescue
+    let ballX = 0;
+    let speedNow = SPEED;
+    let ballY = BALL_RADIUS;
+    let ballZ = 0;
+    let jumping = false;
+    let jumpElapsed = 0;
+    let bufferedGapStart = null;
+    let fallElapsed = 0;
+    let fallVelocity = 0;
+    let rescueElapsed = 0;
+    let rescueFrom = { x: 0, y: 0, z: 0 };
+    let rescueToZ = 0;
+
+    function beginJump() {
+      if (phase !== 'playing' || jumping) return;
+      jumping = true;
+      jumpElapsed = 0;
+      bufferedGapStart = null;
+    }
+
+    function tapToJump() {
+      if (phase !== 'playing' || jumping) return;
+      const gap = nextGap(ballZ);
+      if (gap && gap.start - ballZ > 1.15 && gap.start - ballZ < 6.5) {
+        // Brzký dotyk se zapamatuje a skok začne ve vhodném místě.
+        bufferedGapStart = gap.start;
+      } else {
+        beginJump();
+      }
+    }
+
+    function startFall() {
+      if (phase !== 'playing') return;
+      phase = 'falling';
+      bufferedGapStart = null;
+      jumping = false;
+      fallElapsed = 0;
+      fallVelocity = -0.4;
+    }
+
+    function safeLandingZ(fromZ) {
+      ensureRoad(fromZ);
+      for (const s of roadSections) {
+        const candidate = Math.max(fromZ + 2.5, s.start + 1.5);
+        if (candidate + 5.0 < s.end) return candidate;
+      }
+      return fromZ + 3;
+    }
+
+    function startRescue() {
+      phase = 'rescue';
+      rescueElapsed = 0;
+      rescueFrom = { x: ballX, y: ballY, z: ballZ };
+      rescueToZ = safeLandingZ(ballZ);
+    }
+
+    // --- Orientace displeje: primárně systémový zámek, alternativně otočené plátno. ---
+    // Prohlížeč nemusí dovolit screen.orientation.lock mimo fullscreen / PWA.
+    function updateViewport() {
+      const physicalW = window.innerWidth, physicalH = window.innerHeight;
+      const landscape = physicalW > physicalH;
+      const angle = (screen.orientation && typeof screen.orientation.angle === 'number')
+        ? screen.orientation.angle : (window.orientation || 90);
+      // Pokud systém přesto přepne do landscape, hra zůstane vizuálně v portrétu.
+      displayRotation = landscape ? (angle === 90 || angle === -270 ? -90 : 90) : 0;
+      const logicalW = landscape ? physicalH : physicalW;
+      const logicalH = landscape ? physicalW : physicalH;
+      const canvas = renderer.domElement;
+      canvas.style.position = 'fixed';
+      canvas.style.width = logicalW + 'px';
+      canvas.style.height = logicalH + 'px';
+      canvas.style.transformOrigin = 'top left';
+      canvas.style.transform = displayRotation ? `rotate(${displayRotation}deg)` : 'none';
+      canvas.style.left = displayRotation === 90 ? physicalW + 'px' : '0px';
+      canvas.style.top = displayRotation === -90 ? physicalH + 'px' : '0px';
+      camera.aspect = logicalW / logicalH;
+      camera.updateProjectionMatrix();
+      renderer.setSize(logicalW, logicalH, false);
+    }
+
+    function logicalPointerX(event) {
+      if (displayRotation === -90) return window.innerHeight - event.clientY;
+      if (displayRotation === 90) return event.clientY;
+      return event.clientX;
+    }
+
+    async function enterFullscreenAndLock() {
+      try {
+        if (!document.fullscreenElement && document.documentElement.requestFullscreen) {
+          await document.documentElement.requestFullscreen({ navigationUI: 'hide' });
+        }
+      } catch (_) { /* Některé prohlížeče fullscreen nepovolují. */ }
+      try {
+        if (screen.orientation && screen.orientation.lock) {
+          await screen.orientation.lock('portrait-primary');
+        }
+      } catch (_) { /* CSS záloha zůstává funkční. */ }
+      updateViewport();
+    }
+
+    document.getElementById('play').addEventListener('click', () => {
+      if (phase !== 'menu') return;
+      // Volání oprávnění musí začít přímo během kliknutí, před await.
+      try {
+        if (typeof DeviceOrientationEvent !== 'undefined' &&
+            typeof DeviceOrientationEvent.requestPermission === 'function') {
+          DeviceOrientationEvent.requestPermission().catch(() => {});
+        }
+      } catch (_) {}
+      try {
+        if (typeof DeviceMotionEvent !== 'undefined' &&
+            typeof DeviceMotionEvent.requestPermission === 'function') {
+          DeviceMotionEvent.requestPermission().catch(() => {});
+        }
+      } catch (_) {}
+      enterFullscreenAndLock();
+      calibrateSensors();
+      phase = 'playing';
+      document.getElementById('menu').classList.add('hidden');
+    });
+
+    window.addEventListener('pointerdown', (event) => {
+      if (phase !== 'playing') return;
+      if (event.pointerType === 'mouse' && event.button !== 0) return;
+      fingerDown = true;
+      pointerMoved = false;
+      fingerX = logicalPointerX(event);
+      dragAmount = 0;
+    }, { passive: true });
+
+    window.addEventListener('pointermove', (event) => {
+      if (!fingerDown) return;
+      const dx = logicalPointerX(event) - fingerX;
+      if (Math.abs(dx) > 16) pointerMoved = true;
+      dragAmount = clamp(dx / (Math.min(window.innerWidth, window.innerHeight) * 0.23), -1.5, 1.5);
+    }, { passive: true });
+
+    window.addEventListener('pointerup', () => {
+      if (fingerDown && !pointerMoved) tapToJump();
+      fingerDown = false;
+      dragAmount = 0;
+    }, { passive: true });
+    window.addEventListener('pointercancel', () => {
+      fingerDown = false;
+      dragAmount = 0;
+    }, { passive: true });
+
+    window.addEventListener('keydown', event => {
+      if (event.code === 'ArrowLeft' || event.code === 'KeyA') keys.left = true;
+      if (event.code === 'ArrowRight' || event.code === 'KeyD') keys.right = true;
+      if (event.code === 'ArrowUp' || event.code === 'KeyW') keys.forward = true;
+      if (event.code === 'Space' && !event.repeat) tapToJump();
+      if (['ArrowLeft', 'ArrowRight', 'ArrowUp', 'Space'].includes(event.code)) event.preventDefault();
+    });
+    window.addEventListener('keyup', event => {
+      if (event.code === 'ArrowLeft' || event.code === 'KeyA') keys.left = false;
+      if (event.code === 'ArrowRight' || event.code === 'KeyD') keys.right = false;
+      if (event.code === 'ArrowUp' || event.code === 'KeyW') keys.forward = false;
+    });
+
+    function update(dt) {
+      if (phase === 'playing') {
+        speedNow = currentSpeed();
+        ballZ += speedNow * dt;
+        const rawInput = steeringInput();
+        filteredSteering += (rawInput - filteredSteering) * (1 - Math.exp(-10 * dt));
+        // Skutečné řízení: bez náklonu pokračuje kulička rovně a zatáčka jí uteče.
+        ballX += LATERAL_SPEED * filteredSteering * dt;
+
+        if (bufferedGapStart !== null && ballZ >= bufferedGapStart - 1.15) {
+          beginJump();
+        }
+        if (jumping) {
+          // Skok je řízen ujetou vzdáleností, proto funguje stejně při zrychlení.
+          jumpElapsed += speedNow * dt / JUMP_DISTANCE;
+          const t = Math.min(jumpElapsed, 1);
+          ballY = BALL_RADIUS + 4 * JUMP_HEIGHT * t * (1 - t);
+          if (t >= 1) { jumping = false; ballY = BALL_RADIUS; }
+        } else {
+          ballY = BALL_RADIUS;
+        }
+        // Mezera a opuštění klikaté silnice se posuzují oproti jejímu středu.
+        const overGap = gaps.some(g => ballZ > g.start + 0.16 && ballZ < g.end - 0.16);
+        const offRoad = Math.abs(ballX - centerXAt(ballZ)) > ROAD_WIDTH / 2 + 0.14;
+        if (offRoad || (overGap && !jumping)) startFall();
+      } else if (phase === 'falling') {
+        fallElapsed += dt;
+        ballZ += SPEED * dt * 0.36;
+        fallVelocity -= 5.6 * dt;
+        ballY += fallVelocity * dt;
+        if (fallElapsed >= FALL_WAIT) startRescue();
+      } else if (phase === 'rescue') {
+        rescueElapsed += dt;
+        const t = Math.min(rescueElapsed / RESCUE_TIME, 1);
+        const ease = smooth(t);
+        ballX = THREE.MathUtils.lerp(rescueFrom.x, centerXAt(rescueToZ), ease);
+        ballZ = THREE.MathUtils.lerp(rescueFrom.z, rescueToZ, ease);
+        ballY = THREE.MathUtils.lerp(rescueFrom.y, BALL_RADIUS, ease) + 0.55 * Math.sin(Math.PI * t);
+        if (t >= 1) {
+          phase = 'playing';
+          ballX = centerXAt(rescueToZ);
+          ballY = BALL_RADIUS;
+          ballZ = rescueToZ;
+          jumping = false;
+          calibrateSensors();
+        }
+      }
+
+      ensureRoad(ballZ);
+      ensureScenery(ballZ);
+      ball.position.set(ballX, ballY, ballZ);
+      if (phase === 'playing') {
+        // Rotace kolem osy kolmé k pohybu, včetně zatáček.
+        ball.rotation.x += speedNow * dt / BALL_RADIUS;
+        ball.rotation.z -= LATERAL_SPEED * filteredSteering * dt / BALL_RADIUS;
+      } else if (phase === 'falling') {
+        ball.rotation.x += SPEED * dt * 0.3 / BALL_RADIUS;
+      }
+
+      shadow.position.set(ballX, 0.02, ballZ);
+      shadow.visible = phase === 'playing' && hasRoad(ballZ) && ballY < BALL_RADIUS + 1.5 &&
+        Math.abs(ballX - centerXAt(ballZ)) <= ROAD_WIDTH / 2;
+      shadow.material.opacity = 0.14 * (1 - clamp((ballY - BALL_RADIUS) / 2.2, 0, 0.8));
+
+      // Kamera zezadu mírně natáčí směr pohledu do blížící se zatáčky.
+      const slope = slopeAt(ballZ + 3);
+      const denom = Math.sqrt(1 + slope * slope);
+      const directionX = slope / denom;
+      const directionZ = 1 / denom;
+      const follow = 1 - Math.exp(-2.45 * dt);
+      const verticalOffset = Math.max(-3.0, Math.min(0, ballY - BALL_RADIUS));
+      camera.position.lerp(new THREE.Vector3(
+        ballX - directionX * 9.5, 4.6 + verticalOffset * 0.16,
+        ballZ - directionZ * 9.5), follow);
+      cameraLook.lerp(new THREE.Vector3(
+        centerXAt(ballZ + 8) * 0.80 + ballX * 0.20,
+        0.45 + verticalOffset * 0.28, ballZ + 8), follow);
+      camera.lookAt(cameraLook);
+    }
+
+    ensureRoad(0);
+    ensureScenery(0);
+    ball.position.set(centerXAt(0), BALL_RADIUS, 0);
+
+    const clock = new THREE.Clock();
+    function frame() {
+      const dt = Math.min(clock.getDelta(), 0.045);
+      update(dt);
+      renderer.render(scene, camera);
+      requestAnimationFrame(frame);
+    }
+    frame();
+
+    window.addEventListener('resize', updateViewport);
+    if (screen.orientation && screen.orientation.addEventListener) {
+      screen.orientation.addEventListener('change', updateViewport);
+    }
+    document.addEventListener('fullscreenchange', updateViewport);
+    updateViewport();
+  </script>
+</body>
+</html>
